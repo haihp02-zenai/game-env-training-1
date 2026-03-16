@@ -517,7 +517,7 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
                         immediate_reward = calculator.calculate_step_reward(taken_action, 0.0)
                     else:
                         game_reward = step_reward - 0.5
-                        immediate_reward = game_reward * 3.0
+                        immediate_reward = game_reward * 2.0
             else:
                 immediate_reward = -1.0
             
@@ -811,7 +811,7 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
                         immediate_reward = calculator.calculate_step_reward(taken_action, 0.0)
                     else:
                         game_reward = step_reward - 0.5
-                        immediate_reward = game_reward * 3.0
+                        immediate_reward = game_reward * 2.0
             else:
                 immediate_reward = -1.0
 
