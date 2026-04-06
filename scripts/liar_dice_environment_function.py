@@ -43,6 +43,26 @@ class Action:
         return self.prob
 
 
+# ---------------------------------------------------------------------------
+# Risky move reward parameters
+# ---------------------------------------------------------------------------
+
+# A bid with prob below this is a bluff (we're claiming something unlikely from our view)
+BLUFF_PROB_THRESHOLD = 0.35
+
+# A liar call with prob in [MIN, MAX] is risky: not confident enough to be "safe",
+# not so wild it's just noise.
+RISKY_LIAR_PROB_MIN = 0.35
+RISKY_LIAR_PROB_MAX = 0.60
+
+# Bonus added to the terminal reward per risky action that occurred in a winning episode
+BLUFF_WIN_BONUS     = 0.5
+RISKY_LIAR_WIN_BONUS = 0.5
+
+# Cap how many risky actions contribute to the bonus (avoids incentivising spam)
+RISKY_BONUS_MAX_COUNT = 2
+
+
 @dataclass
 class GameState:
     our_dice: list[int]
@@ -362,10 +382,12 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
         game_state_history: list[GameState] = []
         rewards = []
         calculator = RewardCalculator()
-        
+        bluff_count = 0        # bids made with low prob (bluffing)
+        risky_liar_count = 0   # liar calls made without high confidence
+
         # Determine if this episode gets hints
         use_hints = random.random() < current_hint_prob
-        
+
         # --- Reset Environment (POST /reset) ---
         payload = {"task_id": game_id, "seed": game_id, "opponent": "mcts", "mcts_max_simulations": 50, "mcts_num_rollouts": 1}
 
@@ -512,25 +534,56 @@ def rollout_full_prompt_and_completion_parallelized_curriculum(
                 else:
                     taken_action = next((a for a in previous_game_state.actions if a.action_id == action_id), None)
                     last_action_prob = taken_action.prob if taken_action else 0.0
+
+                    # Classify risky moves for bonus tracking
+                    if taken_action is not None:
+                        if taken_action.is_liar:
+                            # Risky liar call: medium confidence (not sure, but calls anyway)
+                            if RISKY_LIAR_PROB_MIN <= taken_action.prob <= RISKY_LIAR_PROB_MAX:
+                                risky_liar_count += 1
+                        else:
+                            # Bluff: bid with low probability from our own dice view
+                            if taken_action.prob < BLUFF_PROB_THRESHOLD:
+                                bluff_count += 1
+
                     if not done:
                         game_state_history.append(game_state)
                         immediate_reward = calculator.calculate_step_reward(taken_action, 0.0)
                     else:
+                        won = step_reward > 0.5
                         game_reward = step_reward - 0.5
                         immediate_reward = game_reward * 2.0
+                        if won:
+                            # Reward bluffs that paid off
+                            bluff_bonus = BLUFF_WIN_BONUS * min(bluff_count, RISKY_BONUS_MAX_COUNT)
+                            # Reward gutsy liar calls that paid off
+                            risky_liar_bonus = RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
+                            immediate_reward += bluff_bonus + risky_liar_bonus
             else:
                 immediate_reward = -1.0
-            
+
             rewards.append(immediate_reward)
             turn_number += 1
-        
+
         # Calculate final training reward
         discounted_return = calculator.calculate_discounted_return(rewards)
         train_reward = discounted_return
-        
-        print(f"[ID:{game_id} Hints:{int(use_hints)} Done:{int(done)} T:{turn_number:2d} "
-              f"Reward:{train_reward:6.2f} LastProb:{last_action_prob:.3f} LastAct:{action_to_send} EnvR:{final_reward:5.1f} Inv:{invalid_count}]")
-        
+
+        print(
+            "[ID:{:<6} Hints:{} Done:{} T:{:>2d} | Reward:{:>8.2f} | LastProb:{:>7.3f} | "
+            "EnvR:{:>6.1f} | Bluffs:{:<2} RiskyLiar:{:<2} Inv:{:<2}]".format(
+                str(game_id)[:6], 
+                int(use_hints), 
+                int(done), 
+                turn_number, 
+                train_reward, 
+                last_action_prob, 
+                final_reward, 
+                bluff_count, 
+                risky_liar_count, 
+                invalid_count)
+        )
+
         # Truncate episode if completion sequence exceeds max length
         if len(episode_completion_ids) > MAX_EPISODE_TOKENS:
             print(f"Warning: Episode completion exceeded {MAX_EPISODE_TOKENS} tokens ({len(episode_completion_ids)}), truncating")
@@ -694,6 +747,8 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         rewards = []
         calculator = RewardCalculator()
         last_action_prob = 0.0
+        bluff_count = 0        # bids made with low prob (bluffing)
+        risky_liar_count = 0   # liar calls made without high confidence
 
         # Determine if this episode gets hints
         use_hints = random.random() < current_hint_prob
@@ -806,12 +861,31 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
                 else:
                     taken_action = next((a for a in previous_game_state.actions if a.action_id == action_id), None)
                     last_action_prob = taken_action.prob if taken_action else 0.0
+
+                    # Classify risky moves for bonus tracking
+                    if taken_action is not None:
+                        if taken_action.is_liar:
+                            # Risky liar call: medium confidence (not sure, but calls anyway)
+                            if RISKY_LIAR_PROB_MIN <= taken_action.prob <= RISKY_LIAR_PROB_MAX:
+                                risky_liar_count += 1
+                        else:
+                            # Bluff: bid with low probability from our own dice view
+                            if taken_action.prob < BLUFF_PROB_THRESHOLD:
+                                bluff_count += 1
+
                     if not done:
                         game_state_history.append(game_state)
                         immediate_reward = calculator.calculate_step_reward(taken_action, 0.0)
                     else:
+                        won = step_reward > 0.5
                         game_reward = step_reward - 0.5
                         immediate_reward = game_reward * 2.0
+                        if won:
+                            # Reward bluffs that paid off
+                            bluff_bonus = BLUFF_WIN_BONUS * min(bluff_count, RISKY_BONUS_MAX_COUNT)
+                            # Reward gutsy liar calls that paid off
+                            risky_liar_bonus = RISKY_LIAR_WIN_BONUS * min(risky_liar_count, RISKY_BONUS_MAX_COUNT)
+                            immediate_reward += bluff_bonus + risky_liar_bonus
             else:
                 immediate_reward = -1.0
 
@@ -822,8 +896,20 @@ def rollout_last_prompt_and_completion_parallelized_curriculum(
         discounted_return = calculator.calculate_discounted_return(rewards)
         train_reward = discounted_return
 
-        print(f"[ID:{game_id} Hints:{int(use_hints)} Done:{int(done)} T:{turn_number:2d} "
-              f"Reward:{train_reward:6.2f} LastProb:{last_action_prob:.3f} LastAct:{action_to_send} EnvR:{final_reward:5.1f} Inv:{invalid_count}]")
+        print(
+            "[ID:{:<6} Hints:{} Done:{} T:{:>2d} | Reward:{:>8.2f} | LastProb:{:>7.3f} | "
+            "EnvR:{:>6.1f} | Bluffs:{:<2} RiskyLiar:{:<2} Inv:{:<2}]".format(
+                str(game_id)[:6], 
+                int(use_hints), 
+                int(done), 
+                turn_number, 
+                train_reward, 
+                last_action_prob, 
+                final_reward, 
+                bluff_count, 
+                risky_liar_count, 
+                invalid_count)
+        )
 
         return index, {
             "prompt_ids": prompt_ids,
